@@ -60,6 +60,13 @@ final class NowPlayingMonitor: ObservableObject {
         )
     }
 
+    /// Live read, not the snapshot stored on `track`. Immediately after a
+    /// track change this can still report the previous song's position, which
+    /// is why PresenceController re-sends a correction a few seconds later.
+    var liveElapsed: TimeInterval {
+        player.currentPlaybackTime
+    }
+
     deinit {
         player.endGeneratingPlaybackNotifications()
     }

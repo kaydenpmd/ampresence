@@ -16,8 +16,11 @@ Then expose it:  cloudflared tunnel --url http://localhost:8787
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
+import re
+import unicodedata
 import threading
 import time
 import urllib.parse
@@ -34,9 +37,24 @@ try:
 except ImportError:
     LISTENING = None
 
+try:
+    # Controls which line Discord shows in the compact member-list view:
+    # NAME = the app name ("Apple Music"), STATE = artist, DETAILS = title.
+    from pypresence import StatusDisplayType
+    _DISPLAY_CHOICES = {
+        "name": StatusDisplayType.NAME,
+        "state": StatusDisplayType.STATE,
+        "details": StatusDisplayType.DETAILS,
+    }
+except ImportError:
+    _DISPLAY_CHOICES = {}
+
 CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "").strip()
 SECRET = os.environ.get("RELAY_SECRET", "").strip()
 PORT = int(os.environ.get("RELAY_PORT", "8787"))
+
+# Which field shows on the one-line member-list view: name / state / details.
+STATUS_LINE = os.environ.get("STATUS_LINE", "state").strip().lower()
 
 # Clear presence if the phone stops reporting — covers force-quit and the app
 # getting evicted in the background.
@@ -69,24 +87,57 @@ state = State()
 _artwork_cache: dict[str, str] = {}
 
 
-def artwork_url(title: str, artist: str) -> str | None:
+def _normalize(text: str) -> str:
+    """Fold case, strip bracketed qualifiers like (feat. X) / [Remix] and
+    punctuation, so 'Song (Remastered 2011)' and 'Song' compare closely."""
+    text = unicodedata.normalize("NFKD", text or "").lower()
+    text = re.sub(r"\(.*?\)|\[.*?\]", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
+
+
+def _score(result: dict, title: str, artist: str, album: str) -> float:
+    """Album is weighted heavily because the artwork *is* the album cover —
+    the right song off the wrong release still gives you the wrong image."""
+    title_s = _similarity(result.get("trackName", ""), title)
+    artist_s = _similarity(result.get("artistName", ""), artist)
+    if not album:
+        return 0.6 * title_s + 0.4 * artist_s
+    album_s = _similarity(result.get("collectionName", ""), album)
+    return 0.40 * title_s + 0.25 * artist_s + 0.35 * album_s
+
+
+def artwork_url(title: str, artist: str, album: str = "") -> str | None:
     """Public iTunes Search lookup. Current Discord builds accept a plain
     https URL for large_image; older ones need a registered asset key."""
-    key = f"{artist}|{title}"
+    key = f"{artist}|{title}|{album}"
     if key in _artwork_cache:
         return _artwork_cache[key] or None
 
+    # Including the album narrows a huge number of near-duplicate releases.
+    term = " ".join(x for x in (artist, title, album) if x)
     query = urllib.parse.urlencode(
-        {"term": f"{artist} {title}", "entity": "song", "limit": 1}
+        {"term": term, "entity": "song", "limit": 12}
     )
+
+    art = ""
     try:
         with urllib.request.urlopen(
             f"https://itunes.apple.com/search?{query}", timeout=6
         ) as resp:
             payload = json.load(resp)
-        results = payload.get("results") or []
-        art = results[0].get("artworkUrl100", "") if results else ""
-        art = art.replace("100x100bb", "512x512bb")
+
+        results = [r for r in (payload.get("results") or []) if r.get("artworkUrl100")]
+        if results:
+            best = max(results, key=lambda r: _score(r, title, artist, album))
+            # Below this the match is usually a different song entirely, and a
+            # confidently wrong cover is worse than none.
+            if _score(best, title, artist, album) >= 0.55:
+                art = best["artworkUrl100"].replace("100x100bb", "512x512bb")
     except Exception:
         art = ""
 
@@ -120,7 +171,7 @@ def rpc_worker() -> None:
 
         payload = build_payload(track) if track else None
 
-        should_push = payload != last_payload and (
+        should_push = _materially_different(payload, last_payload) and (
             time.time() - last_push >= MIN_PUSH_GAP
         )
 
@@ -146,13 +197,36 @@ def rpc_worker() -> None:
         time.sleep(1)
 
 
+def _materially_different(new: dict | None, old: dict | None) -> bool:
+    """Timestamps are recomputed on every push, so rounding makes them drift a
+    second either way even when nothing changed. Treat that as identical —
+    otherwise each heartbeat re-pushes and visibly nudges the progress bar."""
+    if new is None or old is None:
+        return new is not old
+
+    keys = set(new) | set(old)
+    for key in keys - {"start", "end"}:
+        if new.get(key) != old.get(key):
+            return True
+
+    for key in ("start", "end"):
+        a, b = new.get(key), old.get(key)
+        if (a is None) != (b is None):
+            return True
+        if a is not None and abs(a - b) > 2:
+            return True
+
+    return False
+
+
 def push_with_fallback(rpc: Presence, payload: dict) -> dict:
     """A rejected keyword is a payload problem, not a dead socket. Drop the
     offending field and retry rather than tearing down a live connection.
 
     Optional keys are listed worst-first: activity_type and the artwork fields
     are cosmetic, so shedding them still leaves usable presence."""
-    optional = ("activity_type", "large_text", "large_image", "end", "start")
+    optional = ("status_display_type", "activity_type", "large_text",
+                "large_image", "end", "start")
     attempt = dict(payload)
 
     for _ in range(len(optional) + 1):
@@ -187,6 +261,10 @@ def build_payload(track: dict) -> dict:
     if LISTENING is not None:
         payload["activity_type"] = LISTENING
 
+    display = _DISPLAY_CHOICES.get(STATUS_LINE)
+    if display is not None:
+        payload["status_display_type"] = display
+
     duration = float(track.get("duration") or 0)
     elapsed = float(track.get("elapsed") or 0)
     if duration > 0:
@@ -194,7 +272,7 @@ def build_payload(track: dict) -> dict:
         payload["start"] = int(start)
         payload["end"] = int(start + duration)
 
-    art = artwork_url(title, artist)
+    art = artwork_url(title, artist, album)
     if art:
         payload["large_image"] = art
         if album:
@@ -232,8 +310,21 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(204)
 
     def do_GET(self) -> None:
-        if self.path.rstrip("/") == "/health":
+        path = self.path.rstrip("/")
+
+        if path == "/health":
             return self._reply(200, "ok")
+
+        # Lets a Shortcut check whether the phone is still reporting before it
+        # bothers launching the app — iOS has no way to ask that locally, but
+        # the relay knows, because the app checks in every 30 seconds.
+        if path == "/status":
+            if not SECRET or self.headers.get("X-Relay-Secret", "") != SECRET:
+                return self._reply(401, "unauthorized")
+            _, updated_at = state.get()
+            fresh = updated_at > 0 and (time.time() - updated_at) < IDLE_TIMEOUT
+            return self._reply(200, "alive" if fresh else "stale")
+
         self._reply(404, "not found")
 
     def log_message(self, *args) -> None:
