@@ -16,7 +16,7 @@ targets:
     info:
       path: AMPresence/Info.plist
       properties:
-        CFBundleDisplayName: AM Presence
+        CFBundleDisplayName: Ammy
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -25,10 +25,22 @@ targets:
         # Required for the silent-audio keepalive in KeepAlive.swift.
         UIBackgroundModes:
           - audio
+        # Lets Shortcuts launch the app and say what it should do afterwards:
+        #   ammy://music       → start, then reopen Apple Music
+        #   ammy://background  → start, then drop to the Home Screen
+        # ampresence:// is kept so any existing Shortcuts keep working.
+        CFBundleURLTypes:
+          - CFBundleURLName: net.kaydenpmd.ammy
+            CFBundleURLSchemes:
+              - ammy
+              - ampresence
+        LSApplicationQueriesSchemes:
+          - music
 
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.ampresence
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
