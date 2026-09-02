@@ -54,14 +54,17 @@ sync `bridge/relay.py` to match — they have silently diverged before.
 
 Both halves are versioned. Check these before debugging anything.
 
-**Relay** — `RELAY_VERSION` near the top of `relay.py`, currently `1.0.1`.
-Readable three ways without the filename ever changing:
+**Relay** — `RELAY_VERSION` near the top of `relay.py`, with a changelog in the
+comment above it. Readable three ways without the filename ever changing:
 
 ```
-[init] relay 1.0.1          relay.log, every startup
+[init] relay <version>      relay.log, every startup
 GET /version                e.g. https://ammy.kaydenpmd.net/version
 python relay.py --version
 ```
+
+This document deliberately does **not** state the current version — it went
+stale within the hour, twice. Ask `/version` instead.
 
 `/health` still returns exactly `ok` and nothing else — Shortcuts test for that
 string, which is why the version got its own route.
@@ -268,6 +271,18 @@ filenames are hashes, so they aren't enumerable.
 Gap logging exists to answer whether iOS actually kills the app in the
 background. Gaps are classified as phone-silent versus relay-was-down so a PC
 reboot isn't miscounted as the app dying.
+
+Two halves record it, and both are needed. `note_checkin()` writes the gap when
+a push *arrives*, so it can only measure a silence that ended — a death you
+never noticed would never have been written down at all. `note_silence()` is
+the other half: the RPC worker watches the clock and logs the moment check-ins
+stop. It works whether or not music was playing, because `updated_at` is
+stamped on every push including `playing: false` ones — a paused app keeps
+checking in, a dead one doesn't. `python relay.py --summary` reports silences
+that never got a matching return as "app died and stayed dead".
+
+On the phone, `SilenceWatchdog` is the third leg: it tells you *that* it died,
+15 minutes after the fact. The relay logs tell you how long.
 
 ## Where things stand (September 2026)
 
