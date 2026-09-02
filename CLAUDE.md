@@ -54,11 +54,11 @@ sync `bridge/relay.py` to match — they have silently diverged before.
 
 Both halves are versioned. Check these before debugging anything.
 
-**Relay** — `RELAY_VERSION` near the top of `relay.py`, currently `1.0.0`.
+**Relay** — `RELAY_VERSION` near the top of `relay.py`, currently `1.0.1`.
 Readable three ways without the filename ever changing:
 
 ```
-[init] relay 1.0.0          relay.log, every startup
+[init] relay 1.0.1          relay.log, every startup
 GET /version                e.g. https://ammy.kaydenpmd.net/version
 python relay.py --version
 ```
@@ -273,7 +273,17 @@ reboot isn't miscounted as the app dying.
 
 Working and verified: autostart, artwork via store ID, clickable title/artist/
 cover, album line removed, notification permission granted, versioning on both
-halves.
+halves, and both secrets rotated.
+
+**Done — secrets rotated (Sept 2 2026).** `RELAY_SECRET` regenerated locally by
+PowerShell straight into `.env` so the value never appeared in a chat or a
+screenshot, then entered into the app. Tunnel token refreshed in the dashboard
+and the cloudflared service reinstalled — the refresh alone does *not* close
+existing connections, so the reinstall is what actually retires the old token.
+Verified end to end with `https://ammy.kaydenpmd.net/version`.
+
+**Done — the laptop connector is gone.** The tunnel now lists one connector,
+`KaydensPC`. Nothing to clean up.
 
 **Open — playhead jitter and lag.** The Discord progress bar runs several
 seconds behind Apple Music and nudges around. The relay sets
@@ -287,15 +297,11 @@ later. Likely fix is to anchor `start` once per track, re-anchor only on a
 genuine seek, and pick the anchor implying the furthest-along position across
 recent samples.
 
-**Open — rotate exposed secrets.** `RELAY_SECRET` has appeared in several
-screenshots and the Cloudflare tunnel token in one. Rotating `RELAY_SECRET`
-means changing `.env` and the iOS app's Secret field together. The tunnel token
-lives in the cloudflared Windows service's registry `ImagePath`, not in a
-`config.yml` — token-based installs have no config file.
-
-**Open — remove the laptop's dead cloudflared connector**, so Cloudflare stops
-load-balancing to a host with no relay listening. `am.kaydenpmd.net` returns
-Cloudflare **1033**; `ammy.kaydenpmd.net` returns `ok`.
+Should either secret need rotating again: the tunnel token lives in the
+cloudflared Windows service's registry `ImagePath`, not in a `config.yml` —
+token-based installs have no config file. In the dashboard the **Refresh
+token** button is at the bottom of the **Add a connector** panel, which the
+Cloudflare docs still call "Add a replica".
 
 **Untested — the uploaded-JPEG path.** `art_cache\` is still empty because
 every track played so far has been in the catalog. It's a genuine fallback now
