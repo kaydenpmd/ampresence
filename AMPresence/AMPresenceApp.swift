@@ -1,6 +1,17 @@
 import SwiftUI
 import UIKit
 
+extension Bundle {
+    /// e.g. "1.0 (47)". The build number is the CI run that produced the IPA,
+    /// so this is the quickest way to tell whether the phone is actually
+    /// running the build you just pushed — the artifact is named to match.
+    var displayVersion: String {
+        let short = infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+}
+
 /// What the app should do once it has started, based on how it was launched.
 enum BounceTarget {
     case stay        // opened by tapping the icon — the person wants the UI
@@ -42,7 +53,7 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("Relay") {
-                    TextField("https://am.kaydenpmd.net/now-playing",
+                    TextField("https://ammy.kaydenpmd.net/now-playing",
                               text: $controller.endpoint)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -57,6 +68,7 @@ struct ContentView: View {
                     LabeledContent("Now playing", value: controller.lastPushed)
                     LabeledContent("Media access",
                                    value: controller.monitor.authorized ? "Granted" : "Not granted")
+                    LabeledContent("Version", value: Bundle.main.displayVersion)
                 }
 
                 Section {
