@@ -17,6 +17,11 @@ targets:
       path: AMPresence/Info.plist
       properties:
         CFBundleDisplayName: Ammy
+        # Declared explicitly rather than relying on XcodeGen's defaults, since
+        # the settings screen reads both back at runtime. CI overrides
+        # CURRENT_PROJECT_VERSION with the workflow run number.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -41,6 +46,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.ampresence
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The only version number a human sets. The build number beside it is
+        # the CI run, passed in by build-ipa.yml — the "1" here is just a
+        # placeholder for local builds.
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
