@@ -11,6 +11,7 @@ final class PresenceController: ObservableObject {
     let monitor = NowPlayingMonitor()
 
     private let keepAlive = KeepAlive()
+    private let watchdog = SilenceWatchdog()
     private var relay: PresenceRelay?
     private var bag = Set<AnyCancellable>()
     private var heartbeat: Task<Void, Never>?
@@ -39,6 +40,12 @@ final class PresenceController: ObservableObject {
 
         self.relay = relay
         keepAlive.start()
+
+        // Before anything can be scheduled. An unauthorized center accepts
+        // notification requests and delivers none of them, so skipping this
+        // makes the watchdog look like it works right up until it matters.
+        await watchdog.requestAuthorizationIfNeeded()
+
         await monitor.start()
 
         guard monitor.authorized else {
@@ -64,6 +71,7 @@ final class PresenceController: ObservableObject {
         await relay?.push(track: nil, playing: false)
         relay = nil
         keepAlive.stop()
+        watchdog.cancel()   // stopping on purpose isn't a failure
         linkStatus = "Idle"
         lastPushed = "—"
     }
@@ -91,7 +99,13 @@ final class PresenceController: ObservableObject {
             lastPushed = "Nothing playing"
             Task {
                 let ok = await relay.push(track: nil, playing: false)
-                await MainActor.run { self.linkStatus = ok ? "Running" : "Relay unreachable" }
+                await MainActor.run {
+                    self.linkStatus = ok ? "Running" : "Relay unreachable"
+                    // The watchdog measures whether the app is alive, not
+                    // whether music is playing — so a successful "nothing
+                    // playing" push counts just as much.
+                    if ok { self.watchdog.postpone() }
+                }
             }
             return
         }
@@ -105,6 +119,7 @@ final class PresenceController: ObservableObject {
             await MainActor.run {
                 self.lastPushed = label
                 self.linkStatus = ok ? "Running" : "Relay unreachable"
+                if ok { self.watchdog.postpone() }
             }
         }
     }

@@ -1,5 +1,6 @@
 import Foundation
 import MediaPlayer
+import UIKit
 
 struct Track: Equatable {
     var title: String
@@ -7,6 +8,16 @@ struct Track: Equatable {
     var album: String
     var duration: TimeInterval
     var elapsed: TimeInterval
+
+    /// Apple Music catalog ID. The relay uses this for an exact artwork lookup
+    /// with no fuzzy matching. Local files report "0".
+    var storeID: String
+
+    /// The cover as it exists on the phone, already JPEG-encoded. This is the
+    /// only artwork source that always works: the iTunes Store search index the
+    /// relay falls back to does not contain every track on Apple Music, and
+    /// smaller/independent releases are routinely missing from it.
+    var artworkJPEG: Data?
 
     /// Identity for change detection — elapsed is excluded on purpose.
     var key: String { "\(title)|\(artist)|\(album)" }
@@ -20,6 +31,11 @@ final class NowPlayingMonitor: ObservableObject {
 
     private let player = MPMusicPlayerController.systemMusicPlayer
     private var pollTimer: Timer?
+
+    // refresh() runs on every playback notification and every 5s poll.
+    // Re-encoding a JPEG that often is pure waste, so keep the last one.
+    private var artworkKey: String?
+    private var artworkData: Data?
 
     func start() async {
         let status: MPMediaLibraryAuthorizationStatus = await withCheckedContinuation { cont in
@@ -51,13 +67,36 @@ final class NowPlayingMonitor: ObservableObject {
             return
         }
 
+        let title = item.title ?? "Unknown Track"
+        let artist = item.artist ?? item.albumArtist ?? "Unknown Artist"
+        let album = item.albumTitle ?? ""
+
         track = Track(
-            title: item.title ?? "Unknown Track",
-            artist: item.artist ?? item.albumArtist ?? "Unknown Artist",
-            album: item.albumTitle ?? "",
+            title: title,
+            artist: artist,
+            album: album,
             duration: item.playbackDuration,
-            elapsed: player.currentPlaybackTime
+            elapsed: player.currentPlaybackTime,
+            storeID: item.playbackStoreID,
+            artworkJPEG: artwork(for: item, key: "\(title)|\(artist)|\(album)")
         )
+    }
+
+    /// Cover art for the current item, encoded once per track.
+    ///
+    /// Artwork for a cloud track can be nil on the first read and populated a
+    /// moment later, so a nil result is cached as "not yet" rather than "none":
+    /// the next poll tries again.
+    private func artwork(for item: MPMediaItem, key: String) -> Data? {
+        if artworkKey == key, let cached = artworkData { return cached }
+
+        guard let image = item.artwork?.image(at: CGSize(width: 512, height: 512)),
+              let jpeg = image.jpegData(compressionQuality: 0.8)
+        else { return nil }
+
+        artworkKey = key
+        artworkData = jpeg
+        return jpeg
     }
 
     /// Live read, not the snapshot stored on `track`. Immediately after a
