@@ -91,7 +91,8 @@ PORT = int(os.environ.get("RELAY_PORT", "8787"))
 #   1.0.0  first versioned build. Artwork via store ID and phone-uploaded JPEG,
 #          clickable title/artist/cover, album tooltip behind SHOW_ALBUM,
 #          logging on every artwork failure path.
-RELAY_VERSION = "1.0.0"
+#   1.0.1  dropped connections log one line instead of a traceback.
+RELAY_VERSION = "1.0.1"
 
 # Which field shows on the one-line member-list view: name / state / details.
 STATUS_LINE = os.environ.get("STATUS_LINE", "state").strip().lower()
@@ -620,6 +621,23 @@ def build_payload(track: dict) -> dict:
     return payload
 
 
+class QuietHTTPServer(ThreadingHTTPServer):
+    """A dropped connection is not an error worth a stack trace.
+
+    cloudflared severs its connection whenever the tunnel restarts, and the
+    default handler answers that with a fifteen-line traceback — which, sitting
+    at the bottom of relay.log, reads exactly like a crash. Real errors still
+    get the full trace."""
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError)):
+            print("[http] client disconnected mid-request (normal on tunnel restart)")
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -734,7 +752,7 @@ def main() -> None:
 
     _log_line("relay started")
     threading.Thread(target=rpc_worker, daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server = QuietHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"[http] listening on 127.0.0.1:{PORT}")
     try:
         server.serve_forever()
