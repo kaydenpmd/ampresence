@@ -12,6 +12,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Build identity comes from CI, not from anyone remembering to bump a
+      # number: github.run_number increases on every run, and the short SHA ties
+      # an installed build back to a commit. MARKETING_VERSION stays the single
+      # human-set value in project.yml and is read back out here so the two
+      # can't drift.
+      - name: Work out the version
+        id: ver
+        run: |
+          MARKETING=$(sed -nE 's/.*MARKETING_VERSION: *"?([^"]+)"?.*/\1/p' project.yml | head -1)
+          SHA=$(git rev-parse --short HEAD)
+          NAME="Ammy-${MARKETING}-b${{ github.run_number }}-${SHA}"
+          echo "marketing=${MARKETING}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Building ${NAME}"
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -26,6 +41,8 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
+            MARKETING_VERSION=${{ steps.ver.outputs.marketing }} \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -35,10 +52,10 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/AMPresence.app Payload/
-          zip -qry AMPresence.ipa Payload
+          zip -qry "${{ steps.ver.outputs.name }}.ipa" Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AMPresence-unsigned
-          path: AMPresence.ipa
+          name: ${{ steps.ver.outputs.name }}
+          path: ${{ steps.ver.outputs.name }}.ipa
           if-no-files-found: error
