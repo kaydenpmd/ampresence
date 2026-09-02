@@ -92,7 +92,9 @@ PORT = int(os.environ.get("RELAY_PORT", "8787"))
 #          clickable title/artist/cover, album tooltip behind SHOW_ALBUM,
 #          logging on every artwork failure path.
 #   1.0.1  dropped connections log one line instead of a traceback.
-RELAY_VERSION = "1.0.1"
+#   1.1.0  silences are logged when they start, not only when the phone
+#          returns — a death that is never noticed is now still recorded.
+RELAY_VERSION = "1.1.0"
 
 # Which field shows on the one-line member-list view: name / state / details.
 STATUS_LINE = os.environ.get("STATUS_LINE", "state").strip().lower()
@@ -156,6 +158,10 @@ class State:
 state = State()
 _artwork_cache: dict[str, str] = {}
 
+# Set when the relay notices the phone has stopped checking in, cleared when it
+# comes back. Written only by the RPC worker thread, so no lock is needed.
+_silence_logged_at: float | None = None
+
 
 
 
@@ -195,16 +201,49 @@ def note_checkin(previous: float) -> None:
         _log_line(f"gap {_format_gap(gap)}  phone silent, relay up throughout")
 
 
+def note_silence(last_seen: float) -> None:
+    """Record the moment the phone stops checking in, rather than waiting for
+    it to come back.
+
+    `note_checkin()` can only log a gap once a push arrives, which means a death
+    you never notice is never written down at all — the log stays silent and
+    looks healthy. This is the other half: the relay watches the clock and
+    writes the silence the moment it starts.
+
+    The check works whether or not music was playing, because `updated_at` is
+    stamped on every push including `playing: false` ones. That distinction
+    matters: a paused app keeps checking in, a dead one doesn't."""
+    global _silence_logged_at
+
+    if last_seen <= 0:          # nothing has ever checked in
+        return
+
+    silent_for = time.time() - last_seen
+
+    if silent_for <= GAP_THRESHOLD:
+        _silence_logged_at = None
+        return
+
+    if _silence_logged_at == last_seen:
+        return                  # already recorded this silence
+
+    _silence_logged_at = last_seen
+    when = time.strftime("%H:%M:%S", time.localtime(last_seen))
+    _log_line(f"phone stopped checking in  last seen {when}")
+
+
 def print_summary() -> None:
     """python relay.py --summary"""
     if not UPTIME_LOG.exists():
         print("No uptime log yet.")
         return
 
-    starts, phone_gaps, mixed_gaps = 0, [], []
+    starts, silences, phone_gaps, mixed_gaps = 0, 0, [], []
     for line in UPTIME_LOG.read_text(encoding="utf-8").splitlines():
         if "relay started" in line:
             starts += 1
+        elif "stopped checking in" in line:
+            silences += 1
         elif "gap " in line:
             try:
                 hhmmss = line.split("gap ")[1].split()[0]
@@ -215,6 +254,10 @@ def print_summary() -> None:
             (phone_gaps if "phone silent" in line else mixed_gaps).append(seconds)
 
     print(f"relay starts            : {starts}")
+    print(f"silences detected live  : {silences}")
+    unreturned = silences - len(phone_gaps) - len(mixed_gaps)
+    if unreturned > 0:
+        print(f"  never came back       : {unreturned}   <- app died and stayed dead")
     print(f"phone-only gaps         : {len(phone_gaps)}")
     if phone_gaps:
         print(f"  longest               : {_format_gap(max(phone_gaps))}")
@@ -448,6 +491,7 @@ def rpc_worker() -> None:
                 continue
 
         track, updated_at = state.get()
+        note_silence(updated_at)
         if track and time.time() - updated_at > IDLE_TIMEOUT:
             track = None
 
