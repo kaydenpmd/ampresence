@@ -80,6 +80,19 @@ CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "").strip()
 SECRET = os.environ.get("RELAY_SECRET", "").strip()
 PORT = int(os.environ.get("RELAY_PORT", "8787"))
 
+# Bump on any behaviour change. The filename deliberately never changes — it's
+# referenced by the Scheduled Task and by anything that has been copied around —
+# so this is the only way to tell two copies apart. Printed at startup, served
+# at /version, and available as `python relay.py --version`.
+#
+# Answering "is the installed copy current?" used to mean grepping for a
+# function name that happened to be recent; this replaces that.
+#
+#   1.0.0  first versioned build. Artwork via store ID and phone-uploaded JPEG,
+#          clickable title/artist/cover, album tooltip behind SHOW_ALBUM,
+#          logging on every artwork failure path.
+RELAY_VERSION = "1.0.0"
+
 # Which field shows on the one-line member-list view: name / state / details.
 STATUS_LINE = os.environ.get("STATUS_LINE", "state").strip().lower()
 
@@ -641,7 +654,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
 
         if path == "/health":
+            # Body stays exactly "ok" — Shortcuts and the earlier setup notes
+            # test for that string. Version lives on its own route instead.
             return self._reply(200, "ok")
+
+        if path == "/version":
+            return self._reply(200, RELAY_VERSION)
 
         # Lets a Shortcut check whether the phone is still reporting before it
         # bothers launching the app — iOS has no way to ask that locally, but
@@ -691,6 +709,12 @@ def _ensure_output() -> None:
 def main() -> None:
     _ensure_output()
 
+    # Before anything that can fail, so a misconfigured relay still reports
+    # which copy it is.
+    if "--version" in sys.argv:
+        print(RELAY_VERSION)
+        return
+
     if "--summary" in sys.argv:
         print_summary()
         return
@@ -699,6 +723,8 @@ def main() -> None:
         raise SystemExit("Set DISCORD_CLIENT_ID (from discord.com/developers).")
     if not SECRET:
         raise SystemExit("Set RELAY_SECRET to a long random string.")
+
+    print(f"[init] relay {RELAY_VERSION}")
 
     try:
         from importlib.metadata import version
