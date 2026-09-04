@@ -35,6 +35,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pypresence import Presence
 
 try:
+    # Raised when Discord accepts the connection but refuses the payload. That
+    # is emphatically not a dead socket, and treating it as one costs a
+    # reconnect cycle per attempt while presence sits empty.
+    from pypresence.exceptions import DiscordError, InvalidArgument, ServerError
+    PAYLOAD_REJECTED: tuple = (DiscordError, InvalidArgument, ServerError)
+except ImportError:
+    PAYLOAD_REJECTED = ()
+
+try:
     # Added in pypresence 4.3.0. update() calls .value on this, so a plain
     # int raises AttributeError rather than being coerced.
     from pypresence import ActivityType
@@ -94,7 +103,18 @@ PORT = int(os.environ.get("RELAY_PORT", "8787"))
 #   1.0.1  dropped connections log one line instead of a traceback.
 #   1.1.0  silences are logged when they start, not only when the phone
 #          returns — a death that is never noticed is now still recorded.
-RELAY_VERSION = "1.1.0"
+#   1.2.0  playhead anchored per track instead of recomputed every push, so
+#          the progress bar stops twitching and converges on the true position.
+#   1.2.1  the anchor is paired with the push's arrival time instead of the
+#          current time. build_payload runs every second against a reading the
+#          phone only refreshes every thirty; using time.time() slid `start`
+#          forward a second per second, which was the actual rubberbanding.
+#   1.3.0  one-character titles no longer knock presence offline. Discord
+#          requires 2+ characters in details/state and rejects the activity
+#          otherwise; the worker read that as a dead socket and reconnect-looped
+#          until the song changed. Fields are padded, payload rejections are
+#          distinguished from connection loss, and the retry path can't spin.
+RELAY_VERSION = "1.3.0"
 
 # Which field shows on the one-line member-list view: name / state / details.
 STATUS_LINE = os.environ.get("STATUS_LINE", "state").strip().lower()
@@ -135,6 +155,17 @@ IDLE_TIMEOUT = 90.0
 # Discord rate limits activity updates. Coalesce rapid changes (skipping
 # through a playlist) rather than firing one call per skip.
 MIN_PUSH_GAP = 3.0
+
+# How far the reported position may move before it counts as a deliberate seek
+# rather than a stale read. Observed staleness has been a few seconds; a seek
+# worth reacting to is usually much larger.
+PLAYHEAD_SEEK_TOLERANCE = 10.0
+
+# Grace period after a track change during which any reading is accepted.
+# currentPlaybackTime can still be reporting the previous song for a second or
+# two, and PresenceController fires a correction 2.5s in — that correction has
+# to be able to move the anchor backwards, which the steady-state rule forbids.
+PLAYHEAD_SETTLE_WINDOW = 6.0
 
 
 class State:
@@ -494,8 +525,10 @@ def rpc_worker() -> None:
         note_silence(updated_at)
         if track and time.time() - updated_at > IDLE_TIMEOUT:
             track = None
+        if track is None:
+            playhead.reset()
 
-        payload = build_payload(track) if track else None
+        payload = build_payload(track, updated_at) if track else None
 
         should_push = _materially_different(payload, last_payload) and (
             time.time() - last_push >= MIN_PUSH_GAP
@@ -511,6 +544,14 @@ def rpc_worker() -> None:
                 last_push = time.time()
                 label = payload["details"] if payload else "cleared"
                 print(f"[rpc] {label}")
+            except PAYLOAD_REJECTED as exc:
+                # The socket is fine; Discord just refused this activity. Tearing
+                # the connection down would reconnect and re-send the same bad
+                # payload forever, with presence empty the whole time. Record it
+                # as sent so the worker moves on to the next track instead.
+                print(f"[rpc] Discord refused the payload, skipping it ({exc})")
+                last_payload = payload
+                last_push = time.time()
             except Exception as exc:
                 print(f"[rpc] lost connection ({exc})")
                 try:
@@ -518,6 +559,7 @@ def rpc_worker() -> None:
                 except Exception:
                     pass
                 rpc = None
+                time.sleep(1)   # never spin: reconnecting has a real cost
                 continue
 
         time.sleep(1)
@@ -578,17 +620,109 @@ def push_with_fallback(rpc: Presence, payload: dict) -> dict:
     return attempt
 
 
+# Discord requires `details` and `state` to be at least two characters and
+# rejects the whole activity otherwise — which surfaces as a server error, not
+# as a validation warning. One-character song titles exist ("4", "T", "Ø"), so
+# this is reachable in normal listening. U+2060 WORD JOINER is invisible when
+# rendered but counts toward the length.
+_DISCORD_MIN_FIELD = 2
+_INVISIBLE_PAD = "⁠"
+
+
+def pad_for_discord(text: str, label: str) -> str:
+    if not text.strip():
+        return "Unknown"
+    if len(text) >= _DISCORD_MIN_FIELD:
+        return text
+    print(f"[rpc] padded {label} {text!r} — Discord requires 2+ characters")
+    return text + _INVISIBLE_PAD * (_DISCORD_MIN_FIELD - len(text))
+
+
+class Playhead:
+    """Holds `start` steady for the length of a track.
+
+    Discord renders the position as `now - start`, so `start` is an anchor, not
+    a reading. Recomputing it on every push is what makes the bar twitch: the
+    anchor moves, and the bar jumps with it.
+
+    The anchor is derived from the phone's `elapsed`, which can be stale —
+    `currentPlaybackTime` is not updated eagerly for a backgrounded app. That
+    staleness is not symmetric. A late read makes the song look *earlier* than
+    it really is and can never make it look later, so of two candidate anchors
+    the smaller `start` is always the less stale one. Keeping the minimum
+    therefore converges on the truth instead of wandering around it.
+
+    Three cases break that rule and are handled explicitly:
+
+    * **A different track** — nothing worth keeping.
+    * **A seek** — a deliberate jump in either direction, told apart from
+      staleness by size.
+    * **The seconds just after a track change** — `currentPlaybackTime` can
+      still be reporting the previous song, which reads as *further along* and
+      would otherwise be locked in as a great anchor. The correction push
+      2.5s later must be able to move it back, so during the settle window
+      every reading is accepted.
+    """
+
+    def __init__(self) -> None:
+        self.key: str | None = None
+        self.start: float | None = None
+        self.settled_at = 0.0
+
+    def reset(self) -> None:
+        """Playback stopped. A pause of unknown length invalidates the anchor —
+        Discord would otherwise keep ticking through it."""
+        self.key = None
+        self.start = None
+
+    def anchor(self, key: str, elapsed: float, now: float) -> float:
+        candidate = now - elapsed
+
+        if key != self.key or self.start is None:
+            self.key = key
+            self.start = candidate
+            self.settled_at = now + PLAYHEAD_SETTLE_WINDOW
+            return self.start
+
+        drift = candidate - self.start
+
+        if now < self.settled_at:
+            self.start = candidate
+        elif abs(drift) > PLAYHEAD_SEEK_TOLERANCE:
+            print(f"[playhead] re-anchored {drift:+.1f}s — treating as a seek")
+            self.start = candidate
+        elif drift < -0.5:
+            # Implies the song is further along than the current anchor says.
+            # Staleness cannot produce that, so this reading is the fresher one.
+            print(f"[playhead] corrected {-drift:.1f}s forward")
+            self.start = candidate
+
+        return self.start
+
+
+playhead = Playhead()
+
 _unresolved_seen: set[str] = set()
 
 
-def build_payload(track: dict) -> dict:
+def build_payload(track: dict, observed_at: float) -> dict:
+    """`observed_at` is when this reading *arrived from the phone*, not now.
+
+    That distinction is the whole ballgame for the progress bar. This function
+    runs once a second, but the phone only pushes every thirty, so `track` holds
+    the same frozen `elapsed` for thirty consecutive calls. Pairing that frozen
+    reading with a live `time.time()` makes the computed `start` slide forward a
+    second per second — the bar falls behind, then snaps back when the next push
+    lands. Pairing it with the arrival time instead keeps `start` genuinely
+    constant between pushes, which is what Discord needs to tick smoothly."""
     title = str(track.get("title", "Unknown Track"))[:128]
     artist = str(track.get("artist", "Unknown Artist"))[:128]
     album = str(track.get("album", ""))[:128]
+    track_key = f"{artist}|{title}|{album}"
 
     payload: dict = {
-        "details": title,
-        "state": artist,
+        "details": pad_for_discord(title, "title"),
+        "state": pad_for_discord(artist, "artist"),
     }
 
     # Renders as "Listening to <app name>" instead of "Playing".
@@ -602,7 +736,7 @@ def build_payload(track: dict) -> dict:
     duration = float(track.get("duration") or 0)
     elapsed = float(track.get("elapsed") or 0)
     if duration > 0:
-        start = time.time() - elapsed
+        start = playhead.anchor(track_key, elapsed, observed_at)
         payload["start"] = int(start)
         payload["end"] = int(start + duration)
 
@@ -615,8 +749,6 @@ def build_payload(track: dict) -> dict:
     store_id = str(track.get("store_id") or "").strip()
     if store_id and store_id not in ("0", "-1"):
         art, matched_album = artwork_by_store_id(store_id)
-
-    track_key = f"{artist}|{title}|{album}"
 
     if not art and track.get("artwork_b64"):
         art = store_uploaded_artwork(track_key, track["artwork_b64"])
