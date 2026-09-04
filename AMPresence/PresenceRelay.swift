@@ -26,7 +26,14 @@ actor PresenceRelay {
 
     @discardableResult
     func push(track: Track?, playing: Bool) async -> Bool {
-        var body: [String: Any] = ["playing": playing && track != nil]
+        // The relay stamps this onto every uptime entry. Whether the app
+        // survives backgrounding is decided by code in *this* build, so the
+        // build number is the axis worth attributing gaps to — without it the
+        // log can't tell a regression from ordinary noise.
+        var body: [String: Any] = [
+            "playing": playing && track != nil,
+            "app_version": Bundle.main.displayVersion,
+        ]
 
         // Set only when this push actually carries the cover, so a failed
         // request doesn't mark it delivered.
