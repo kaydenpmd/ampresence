@@ -42,10 +42,14 @@ final class SilenceWatchdog {
     func postpone() {
         guard authorized else { return }
 
+        // Short on purpose: a notification is scanned, not read. And "isn't
+        // running" states the current fact without asserting a history the
+        // watchdog cannot know — after a reboot the app never started at all,
+        // so "stopped" would be wrong. Resist adding a guess at the cause;
+        // force quit, a reboot and a dead battery all look identical from here.
         let content = UNMutableNotificationContent()
-        content.title = "Ammy stopped"
-        content.body = "No update for 15 minutes — iOS most likely suspended it. "
-                     + "Open Ammy to start it again."
+        content.title = "Ammy isn't running"
+        content.body = "Tap to open"
         content.sound = .default
 
         let request = UNNotificationRequest(
